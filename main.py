@@ -153,10 +153,66 @@ class GitLabClient:
             logger.error(f"Ошибка получения содержимого {file_path}: {e}")
             return None
     
+    async def get_base_file_paths(self, project, file_path, commit_id):
+        """
+        Получает список родительских директорий для контекста
+        """
+        try:
+            parts = file_path.split('/')
+            base_paths = []
+            
+            # Добавляем path с исключением последних компонентов (максимум 2 родительские директории)
+            current_path = ""
+            for part in parts[:-1]:  # Исключаем имя файла
+                current_path = f"{current_path}/{part}" if current_path else part
+                if part.endswith('.py') or part == 'views.py' or part == 'models.py' or part == 'serializers.py':
+                    base_paths.append(current_path)
+            
+            # Добавляем соответствующие файлы views/models/serializers, если изменен один из них
+            file_name = parts[-1]
+            if file_name == 'views.py':
+                base_paths.append(f"{'/'.join(parts[:-1])}/models.py")
+                base_paths.append(f"{'/'.join(parts[:-1])}/serializers.py")
+            elif file_name == 'models.py':
+                base_paths.append(f"{'/'.join(parts[:-1])}/views.py")
+            elif file_name == 'serializers.py':
+                base_paths.append(f"{'/'.join(parts[:-1])}/views.py")
+                base_paths.append(f"{'/'.join(parts[:-1])}/models.py")
+                
+            # Исключаем дубликаты
+            base_paths = list(set(base_paths))
+            return base_paths
+        except Exception as e:
+            logger.error(f"Ошибка получения базовых путей: {e}")
+            return []
+
+    async def get_context_files(self, project, file_path, commit_id, max_file_size=10000):
+        """
+        Получает содержимое контекстных файлов для анализа
+        """
+        base_paths = await self.get_base_file_paths(project, file_path, commit_id)
+        context_files = []
+        
+        for path in base_paths:
+            try:
+                content = await self.get_file_content(project, path, commit_id)
+                if content:
+                    if len(content) > max_file_size:
+                        content = content[:max_file_size] + f"\n... [обрезано, полный размер: {len(content)} символов]"
+                    
+                    context_files.append({
+                        'path': path,
+                        'content': content
+                    })
+            except Exception as e:
+                logger.debug(f"Не удалось получить контекстный файл {path}: {e}")
+                
+        return context_files
+        
     async def get_commit_details(self, project_path, commit_id, max_files=5, max_file_size=10000, debug_mode=False):
         project = self.get_project(project_path)
         if not project:
-            return None, []
+            return None, [], []
         
         try:
             commit = project.commits.get(commit_id)
@@ -172,6 +228,8 @@ class GitLabClient:
             diff = diff[:max_files]
             
             modified_files = []
+            context_files = []  # Новый список для контекстных файлов
+            
             for d in diff:
                 if d.get('new_path') and d.get('old_path'):
                     file_path = d.get('new_path')
@@ -200,15 +258,27 @@ class GitLabClient:
                         'new_content': new_content
                     })
                     
+                    # Получаем контекстные файлы для этого измененного файла
+                    file_context = await self.get_context_files(project, file_path, commit_id, max_file_size)
+                    context_files.extend(file_context)
+                    
                     if debug_mode:
                         logger.info(f"[DEBUG] Файл {file_path} обработан")
                         logger.info(f"[DEBUG] Размеры: diff={len(diff_content)}, old={len(old_content) if old_content else 0}, new={len(new_content) if new_content else 0}")
             
-            logger.info(f"Получены детали коммита {commit_id[:7]}, файлов: {len(modified_files)}")
-            return commit, modified_files
+            # Убираем дубликаты из контекстных файлов
+            unique_context_files = []
+            processed_paths = set()
+            for cf in context_files:
+                if cf['path'] not in processed_paths:
+                    processed_paths.add(cf['path'])
+                    unique_context_files.append(cf)
+            
+            logger.info(f"Получены детали коммита {commit_id[:7]}, измененных файлов: {len(modified_files)}, контекстных файлов: {len(unique_context_files)}")
+            return commit, modified_files, unique_context_files
         except Exception as e:
             logger.error(f"Ошибка получения деталей коммита {commit_id[:7]}: {e}")
-            return None, []
+            return None, [], []
 
 class LLMAnalyzer:
     def __init__(self, api_key, site_url, site_name):
@@ -221,14 +291,14 @@ class LLMAnalyzer:
         }
         logger.info("LLM анализатор инициализирован")
     
-    async def analyze_changes(self, modified_files, debug_mode=False):
+    async def analyze_changes(self, modified_files, context_files, debug_mode=False):
         # Разбиваем анализ на несколько более мелких запросов, если необходимо
         if len(modified_files) > 3:
             # Если файлов слишком много, анализируем по частям
             batches = []
             current_batch = []
             current_size = 0
-            max_batch_size = 15000  # Примерное ограничение размера пакета
+            max_batch_size = 120000  # Увеличенное ограничение размера пакета
             
             for file in modified_files:
                 file_size = len(file['diff']) + len(file['new_content'] or '') + len(file['old_content'] or '')
@@ -253,22 +323,22 @@ class LLMAnalyzer:
                 if debug_mode:
                     logger.info(f"[DEBUG] Анализ пакета {i+1}/{len(batches)}, файлов: {len(batch)}")
                 
-                desc, errors = await self._analyze_batch(batch, debug_mode)
+                desc, errors = await self._analyze_batch(batch, context_files, debug_mode)
                 if desc:
                     all_descriptions.append(desc)
-                if errors and errors != "Нет":
+                if errors and errors != "Нет явных ошибок":
                     all_errors.append(errors)
             
             final_desc = " ".join(all_descriptions)
-            final_errors = "Нет" if not all_errors else "\n".join(all_errors)
+            final_errors = "Нет явных ошибок" if not all_errors else "\n".join(all_errors)
             
             return final_desc, final_errors
         else:
             # Если файлов немного, анализируем все сразу
-            return await self._analyze_batch(modified_files, debug_mode)
+            return await self._analyze_batch(modified_files, context_files, debug_mode)
     
-    async def _analyze_batch(self, file_batch, debug_mode=False):
-        prompt = self._create_prompt(file_batch)
+    async def _analyze_batch(self, file_batch, context_files, debug_mode=False):
+        prompt = self._create_prompt(file_batch, context_files)
         
         if debug_mode:
             logger.info(f"[DEBUG] ПРОМТ ДЛЯ LLM:\n{prompt}")
@@ -283,8 +353,9 @@ class LLMAnalyzer:
                     "content": prompt
                 }
             ],
-            # Увеличиваем лимит для более подробного анализа
-            "max_tokens": 800
+
+            #"max_tokens": 1200,
+            "temperature": 0.2
         }
         
         try:
@@ -311,7 +382,7 @@ class LLMAnalyzer:
                     
                     parts = analysis.split("Ошибки:")
                     desc = parts[0].strip()
-                    errors = parts[1].strip() if len(parts) > 1 else "Нет"
+                    errors = parts[1].strip() if len(parts) > 1 else "Нет явных ошибок"
                     
                     logger.debug(f"Анализ получен, длина: {len(analysis)}")
                     return desc, errors
@@ -319,69 +390,78 @@ class LLMAnalyzer:
             logger.error(f"Ошибка анализа: {e}")
             return None, None
     
-    def _create_prompt(self, modified_files):
-        # Расширенный и улучшенный промт для более глубокого анализа кода
+
+
+    def _create_prompt(self, modified_files, context_files):
+        # Максимально абстрактный промт, ограничивающийся только явными ошибками
         prompt = """
-Ты опытный аудитор кода и эксперт по Python/Django и React/JavaScript с глубоким пониманием архитектуры веб-приложений. Твоя задача — проанализировать предложенные изменения в коде и выявить любые потенциальные проблемы, сосредоточившись исключительно на критичных аспектах (стилистика, форматирование и линтеры не учитываются). Обрати особое внимание на следующие ключевые моменты:
+    Ты эксперт по код-ревью Python. Твоя задача - найти ТОЛЬКО ЯВНЫЕ синтаксические ошибки или несоответствия в коде.
 
-Вызовы несуществующих методов или некорректный доступ к атрибутам:
-Проверь, существуют ли вызываемые методы и атрибуты в текущем контексте, включая импорты и зависимости.
-Убедись, что доступ к объектам соответствует их структуре (например, нет попыток обращения к полям, которых нет в моделях или объектах).
-Несоответствие интерфейсов и API:
-Проверь корректность наследования классов, использования миксинов и интерфейсов, особенно в Django и React.
-Убедись, что ожидаемые сигнатуры методов и API (включая сторонние библиотеки) соблюдены.
-Логические ошибки и потенциальные баги:
-Ищи скрытые логические проблемы, такие как неправильные условия, некорректная обработка краевых случаев или пропущенные проверки.
-Обрати внимание на возможные состояния гонки или недетерминированное поведение.
-Небезопасные операции и уязвимости безопасности:
-Выяви потенциальные уязвимости, такие как SQL-инъекции, XSS, CSRF, утечки данных или неправильная валидация входных данных.
-Проверь использование чувствительных данных (например, паролей, токенов) и их защиту.
-Проблемы с производительностью и утечки ресурсов:
-Оцени эффективность кода: избыточные запросы к базе данных (N+1), неоптимальные циклы, отсутствие кэширования там, где оно необходимо.
-Проверь, нет ли утечек памяти, незакрытых соединений или неуправляемого роста ресурсов.
-Для Django-кода дополнительно:
+    ВАЖНО: НИКОГДА не предполагай ошибки, если:
+    1. Ты не видишь полного определения метода/функции
+    2. Ты не видишь всех импортов и базовых классов
+    3. Ты не можешь на 100% подтвердить ошибку из представленного кода
 
-Убедись в правильности использования методов миксинов (например, порядок разрешения методов в MRO).
-Проверь реализацию REST API endpoints: корректность сериализаторов, валидации, обработки ошибок и соответствие HTTP-методам (GET, POST, PUT, DELETE).
-Оцени обработку запросов: фильтрацию, пагинацию, права доступа (permissions) и работу с Querysets.
-Проверь корректность работы с моделями, миграциями и транзакциями.
-Для React/JavaScript-кода дополнительно:
+    Ты должен анализировать только:
+    - Синтаксические ошибки Python (явные ошибки в синтаксисе)
+    - Использование неопределенных переменных (только если ты 100% уверен)
+    - Явные логические ошибки (например, условие if x == x: return False)
 
-Проверь управление состоянием (state, props) и корректность передачи данных между компонентами.
-Оцени использование хуков (например, useEffect, useState) на предмет бесконечных циклов или утечек.
-Проверь асинхронные операции (fetch, Promises) на обработку ошибок и завершение.
+    ЗАПРЕЩЕНО сообщать об ошибках, если:
+    - Метод может быть унаследован от родительского класса 
+    - Метод может быть определен в другом месте кода
+    - Сигнатура метода неизвестна полностью
+    - Нет уверенности в требуемых параметрах функции
 
-        """
+    Формат ответа:
+    1. Краткое описание изменений: [суть изменений в одном предложении]
+    2. Ошибки: [ТОЛЬКО если 100% явная ошибка синтаксиса] ИЛИ "Нет явных ошибок"
+    """
         
+        # Добавляем контекстные файлы только для общего понимания
+        if context_files:
+            prompt += "\n\nКОНТЕКСТНЫЕ ФАЙЛЫ:\n"
+            for idx, file in enumerate(context_files):
+                if 'path' in file and 'content' in file:
+                    prompt += f"\nКОНТЕКСТНЫЙ ФАЙЛ {idx+1}: {file['path']}\n```python\n{file['content']}\n```\n"
+        
+        # Добавляем измененные файлы
         for idx, file in enumerate(modified_files):
-            file_summary = f"ФАЙЛ {idx+1}: {file['path']}\n\n"
+            file_summary = f"\nИЗМЕНЕННЫЙ ФАЙЛ {idx+1}: {file['path']}\n\n"
             
-            # Всегда добавляем содержимое файла до изменений, если оно есть
+            # Добавляем содержимое файла до изменений для контекста
             if file['old_content']:
-                file_summary += f"--- СОДЕРЖИМОЕ ДО ИЗМЕНЕНИЙ ---\n{file['old_content']}\n\n"
+                file_summary += f"СОДЕРЖИМОЕ ДО ИЗМЕНЕНИЙ:\n```python\n{file['old_content']}\n```\n\n"
             
             # Добавляем дифф для наглядности изменений
-            file_summary += f"--- ИЗМЕНЕНИЯ (DIFF) ---\n{file['diff']}\n\n"
+            file_summary += f"ИЗМЕНЕНИЯ (DIFF):\n```diff\n{file['diff']}\n```\n\n"
             
             # Добавляем новое содержимое файла для полного контекста
             if file['new_content']:
-                file_summary += f"--- СОДЕРЖИМОЕ ПОСЛЕ ИЗМЕНЕНИЙ ---\n{file['new_content']}\n\n"
+                file_summary += f"СОДЕРЖИМОЕ ПОСЛЕ ИЗМЕНЕНИЙ:\n```python\n{file['new_content']}\n```\n\n"
             
             prompt += file_summary
         
+        # Финальная инструкция с максимальной строгостью
         prompt += """
-        Дай анализ в лаконичном формате:
+    НАПОМИНАНИЕ: 
+    - Сообщай ТОЛЬКО о 100% явных ошибках в синтаксисе Python
+    - НИКОГДА не делай предположений о структуре кода, которую не видишь
+    - НЕ предполагай сигнатуры методов без полного определения
+    - НЕ предполагай наличие или отсутствие параметров у методов
+    - При ЛЮБОМ сомнении - ответ "Нет явных ошибок"
 
-        1. Краткое описание изменений: что именно было изменено (одно предложение)
-        2. Ошибки: если найдены, укажи конкретно главную проблему или несколько ключевых проблем, минимально-необходимое объяснение, файл и строку где проблема
-
-        Не используй многословные описания, не добавляй лишние объяснения. Формат ответа должен быть минималистичным и конкретным.
-
-        Если ошибок нет, просто напиши "Нет".
-        """
+    Формат ответа:
+    1. Краткое описание изменений: [суть изменений в одном предложении]
+    2. Ошибки: [ТОЛЬКО 100% явные синтаксические ошибки] ИЛИ "Нет явных ошибок"
+    """
         
-        logger.debug(f"Создан промт, длина: {len(prompt)}")
+        logger.debug(f"Создан абстрактный промт, длина: {len(prompt)}")
         return prompt
+
+
+
+
 
 class TelegramNotifier:
     def __init__(self, token, chat_id):
@@ -391,12 +471,18 @@ class TelegramNotifier:
     
     async def send_message(self, message):
         try:
-            await self.bot.send_message(chat_id=self.chat_id, text=message)
+            await self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode="Markdown")
             logger.debug(f"Отправлено сообщение, длина: {len(message)}")
             return True
         except Exception as e:
             logger.error(f"Ошибка отправки сообщения: {e}")
-            return False
+            # Попытка отправить без разметки в случае ошибки
+            try:
+                await self.bot.send_message(chat_id=self.chat_id, text=message)
+                return True
+            except Exception as e2:
+                logger.error(f"Повторная ошибка отправки сообщения: {e2}")
+                return False
 
 class CommitMonitor:
     def __init__(self, config, debug_mode=False, max_files=5, max_file_size=10000):
@@ -433,7 +519,7 @@ class CommitMonitor:
                 commit_time = parse_datetime(commit.created_at)
                 logger.info(f"Обработка коммита {commit.id[:7]} от {commit_time} в {project_path}")
                 
-                commit_obj, modified_files = await self.gitlab_client.get_commit_details(
+                commit_obj, modified_files, context_files = await self.gitlab_client.get_commit_details(
                     project_path, commit.id, 
                     max_files=self.max_files,
                     max_file_size=self.max_file_size,
@@ -445,7 +531,9 @@ class CommitMonitor:
                     self.db_manager.mark_processed(project_path, commit.id, commit_time)
                     continue
                 
-                desc, errors = await self.llm_analyzer.analyze_changes(modified_files, self.debug_mode)
+                desc, errors = await self.llm_analyzer.analyze_changes(
+                    modified_files, context_files, self.debug_mode
+                )
                 
                 if desc is None:
                     logger.warning(f"Не удалось проанализировать коммит {commit.id[:7]}")
@@ -464,8 +552,8 @@ class CommitMonitor:
                     f"Изменения: {desc}\n"
                 )
                 
-                # Добавляем информацию об ошибках только если они есть
-                if errors and errors != "Нет":
+                # Добавляем информацию об ошибках только если они есть и это не "Нет явных ошибок"
+                if errors and errors != "Нет явных ошибок":
                     msg += f"⚠️ Ошибки: {errors}"
                 
                 await self.notifier.send_message(msg)
@@ -523,9 +611,7 @@ def load_config():
         "openrouter_api_key": os.getenv("OPENROUTER_API_KEY"),
         "site_url": os.getenv("YOUR_SITE_URL", "https://example.com"),
         "site_name": os.getenv("YOUR_SITE_NAME", "GitLab Monitor"),
-        "repositories": os.getenv("REPOSITORIES", "").split(",") if os.getenv("REPOSITORIES") else [
-
-        ]
+        "repositories": os.getenv("REPOSITORIES", "").split(",") if os.getenv("REPOSITORIES") else []
     }
     
     logger.info(f"Конфигурация загружена: {len(config['repositories'])} репозиториев")
@@ -579,3 +665,20 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
