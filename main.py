@@ -11,12 +11,76 @@ import logging
 import argparse
 import re
 import json
+from smart_context_analyzer import LLMAnalyzer
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# Добавить в начало main.py, после других импортов
+import time
+import functools
+
+# Декоратор для повторных попыток при временных ошибках GitLab API
+def gitlab_retry(max_retries=3, retry_delay=5):
+    def decorator(func):
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except gitlab.exceptions.GitlabError as e:
+                    # Проверяем коды временных ошибок
+                    if hasattr(e, 'response_code') and e.response_code in [429, 500, 502, 503, 504]:
+                        retries += 1
+                        if retries >= max_retries:
+                            logger.error(f"Превышено максимальное число попыток ({max_retries}) для {func.__name__}: {e}")
+                            break
+                        logger.warning(f"Временная ошибка GitLab API в {func.__name__}: {e}. Повторная попытка {retries}/{max_retries} через {retry_delay} сек")
+                        time.sleep(retry_delay)
+                    else:
+                        # Не повторяем при других ошибках
+                        logger.error(f"Ошибка GitLab API в {func.__name__}: {e}")
+                        break
+                except Exception as e:
+                    logger.error(f"Непредвиденная ошибка в {func.__name__}: {e}")
+                    break
+            return None  # Возвращаем None, если все попытки неудачны
+
+        async def async_wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return await func(*args, **kwargs)
+                except gitlab.exceptions.GitlabError as e:
+                    # Проверяем коды временных ошибок
+                    if hasattr(e, 'response_code') and e.response_code in [429, 500, 502, 503, 504]:
+                        retries += 1
+                        if retries >= max_retries:
+                            logger.error(f"Превышено максимальное число попыток ({max_retries}) для {func.__name__}: {e}")
+                            break
+                        logger.warning(f"Временная ошибка GitLab API в {func.__name__}: {e}. Повторная попытка {retries}/{max_retries} через {retry_delay} сек")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        # Не повторяем при других ошибках
+                        logger.error(f"Ошибка GitLab API в {func.__name__}: {e}")
+                        break
+                except Exception as e:
+                    logger.error(f"Непредвиденная ошибка в {func.__name__}: {e}")
+                    break
+            return None  # Возвращаем None, если все попытки неудачны
+
+        # Выбираем нужную обертку в зависимости от типа функции
+        if asyncio.iscoroutinefunction(func):
+            return async_wrapper
+        return sync_wrapper
+    return decorator
+
+
 
 def parse_datetime(date_str):
     """
@@ -100,18 +164,24 @@ class DBManager:
         conn.close()
         logger.debug(f"Коммит {commit_id[:7]} в {project} помечен как обработанный")
 
+
+
+
+
 class GitLabClient:
     def __init__(self, gitlab_url, token):
         self.client = gitlab.Gitlab(gitlab_url, private_token=token)
         logger.info("GitLab клиент инициализирован")
-    
+
+    @gitlab_retry (max_retries=3, retry_delay=5)
     def get_project(self, project_path):
         try:
             return self.client.projects.get(project_path)
         except gitlab.exceptions.GitlabGetError as e:
             logger.error(f"Ошибка доступа к проекту {project_path}: {e}")
             return None
-    
+
+    @gitlab_retry (max_retries=3, retry_delay=5)
     async def fetch_recent_commits(self, project_path, start_time, db_manager):
         project = self.get_project(project_path)
         if not project:
@@ -138,81 +208,43 @@ class GitLabClient:
         except Exception as e:
             logger.error(f"Ошибка получения коммитов {project_path}: {e}")
             return []
-    
+
+    @gitlab_retry (max_retries=3, retry_delay=5)
     async def get_file_content(self, project, file_path, commit_id=None):
         try:
             if commit_id:
-                content = project.files.get(file_path=file_path, ref=commit_id).decode()
+                file_obj = project.files.get (file_path=file_path, ref=commit_id)
             else:
-                content = project.files.get(file_path=file_path).decode()
-            return content
-        except gitlab.exceptions.GitlabGetError:
-            logger.debug(f"Файл {file_path} не найден")
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка получения содержимого {file_path}: {e}")
-            return None
-    
-    async def get_base_file_paths(self, project, file_path, commit_id):
-        """
-        Получает список родительских директорий для контекста
-        """
-        try:
-            parts = file_path.split('/')
-            base_paths = []
-            
-            # Добавляем path с исключением последних компонентов (максимум 2 родительские директории)
-            current_path = ""
-            for part in parts[:-1]:  # Исключаем имя файла
-                current_path = f"{current_path}/{part}" if current_path else part
-                if part.endswith('.py') or part == 'views.py' or part == 'models.py' or part == 'serializers.py':
-                    base_paths.append(current_path)
-            
-            # Добавляем соответствующие файлы views/models/serializers, если изменен один из них
-            file_name = parts[-1]
-            if file_name == 'views.py':
-                base_paths.append(f"{'/'.join(parts[:-1])}/models.py")
-                base_paths.append(f"{'/'.join(parts[:-1])}/serializers.py")
-            elif file_name == 'models.py':
-                base_paths.append(f"{'/'.join(parts[:-1])}/views.py")
-            elif file_name == 'serializers.py':
-                base_paths.append(f"{'/'.join(parts[:-1])}/views.py")
-                base_paths.append(f"{'/'.join(parts[:-1])}/models.py")
-                
-            # Исключаем дубликаты
-            base_paths = list(set(base_paths))
-            return base_paths
-        except Exception as e:
-            logger.error(f"Ошибка получения базовых путей: {e}")
-            return []
+                file_obj = project.files.get (file_path=file_path)
 
-    async def get_context_files(self, project, file_path, commit_id, max_file_size=10000):
-        """
-        Получает содержимое контекстных файлов для анализа
-        """
-        base_paths = await self.get_base_file_paths(project, file_path, commit_id)
-        context_files = []
-        
-        for path in base_paths:
-            try:
-                content = await self.get_file_content(project, path, commit_id)
-                if content:
-                    if len(content) > max_file_size:
-                        content = content[:max_file_size] + f"\n... [обрезано, полный размер: {len(content)} символов]"
-                    
-                    context_files.append({
-                        'path': path,
-                        'content': content
-                    })
-            except Exception as e:
-                logger.debug(f"Не удалось получить контекстный файл {path}: {e}")
-                
-        return context_files
-        
+            # Правильная обработка байтового содержимого
+            if hasattr (file_obj, 'content'):
+                content = file_obj.content
+                # Если content уже строка, используем её, иначе декодируем из base64
+                if isinstance (content, str):
+                    return content
+                else:
+                    import base64
+                    return base64.b64decode (content).decode ('utf-8', errors='replace')
+            elif hasattr (file_obj, 'decode'):
+                # Для совместимости со старыми версиями python-gitlab
+                return file_obj.decode ()
+            else:
+                logger.error (f"Объект файла не имеет метода decode() или атрибута content")
+                return None
+
+        except gitlab.exceptions.GitlabGetError:
+            logger.debug (f"Файл {file_path} не найден")
+            return None
+        except Exception as e:
+            logger.error (f"Ошибка получения содержимого {file_path}: {e}")
+            return None
+
+    @gitlab_retry (max_retries=3, retry_delay=5)
     async def get_commit_details(self, project_path, commit_id, max_files=5, max_file_size=10000, debug_mode=False):
         project = self.get_project(project_path)
         if not project:
-            return None, [], []
+            return None, []
         
         try:
             commit = project.commits.get(commit_id)
@@ -228,8 +260,6 @@ class GitLabClient:
             diff = diff[:max_files]
             
             modified_files = []
-            context_files = []  # Новый список для контекстных файлов
-            
             for d in diff:
                 if d.get('new_path') and d.get('old_path'):
                     file_path = d.get('new_path')
@@ -258,210 +288,15 @@ class GitLabClient:
                         'new_content': new_content
                     })
                     
-                    # Получаем контекстные файлы для этого измененного файла
-                    file_context = await self.get_context_files(project, file_path, commit_id, max_file_size)
-                    context_files.extend(file_context)
-                    
                     if debug_mode:
                         logger.info(f"[DEBUG] Файл {file_path} обработан")
                         logger.info(f"[DEBUG] Размеры: diff={len(diff_content)}, old={len(old_content) if old_content else 0}, new={len(new_content) if new_content else 0}")
             
-            # Убираем дубликаты из контекстных файлов
-            unique_context_files = []
-            processed_paths = set()
-            for cf in context_files:
-                if cf['path'] not in processed_paths:
-                    processed_paths.add(cf['path'])
-                    unique_context_files.append(cf)
-            
-            logger.info(f"Получены детали коммита {commit_id[:7]}, измененных файлов: {len(modified_files)}, контекстных файлов: {len(unique_context_files)}")
-            return commit, modified_files, unique_context_files
+            logger.info(f"Получены детали коммита {commit_id[:7]}, файлов: {len(modified_files)}")
+            return commit, modified_files
         except Exception as e:
             logger.error(f"Ошибка получения деталей коммита {commit_id[:7]}: {e}")
-            return None, [], []
-
-class LLMAnalyzer:
-    def __init__(self, api_key, site_url, site_name):
-        self.api_key = api_key
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": site_url,
-            "X-Title": site_name,
-            "Content-Type": "application/json"
-        }
-        logger.info("LLM анализатор инициализирован")
-    
-    async def analyze_changes(self, modified_files, context_files, debug_mode=False):
-        # Разбиваем анализ на несколько более мелких запросов, если необходимо
-        if len(modified_files) > 3:
-            # Если файлов слишком много, анализируем по частям
-            batches = []
-            current_batch = []
-            current_size = 0
-            max_batch_size = 120000  # Увеличенное ограничение размера пакета
-            
-            for file in modified_files:
-                file_size = len(file['diff']) + len(file['new_content'] or '') + len(file['old_content'] or '')
-                if current_size + file_size > max_batch_size and current_batch:
-                    batches.append(current_batch)
-                    current_batch = [file]
-                    current_size = file_size
-                else:
-                    current_batch.append(file)
-                    current_size += file_size
-            
-            if current_batch:
-                batches.append(current_batch)
-            
-            if debug_mode:
-                logger.info(f"[DEBUG] Разбивка на {len(batches)} пакетов для анализа")
-            
-            all_descriptions = []
-            all_errors = []
-            
-            for i, batch in enumerate(batches):
-                if debug_mode:
-                    logger.info(f"[DEBUG] Анализ пакета {i+1}/{len(batches)}, файлов: {len(batch)}")
-                
-                desc, errors = await self._analyze_batch(batch, context_files, debug_mode)
-                if desc:
-                    all_descriptions.append(desc)
-                if errors and errors != "Нет явных ошибок":
-                    all_errors.append(errors)
-            
-            final_desc = " ".join(all_descriptions)
-            final_errors = "Нет явных ошибок" if not all_errors else "\n".join(all_errors)
-            
-            return final_desc, final_errors
-        else:
-            # Если файлов немного, анализируем все сразу
-            return await self._analyze_batch(modified_files, context_files, debug_mode)
-    
-    async def _analyze_batch(self, file_batch, context_files, debug_mode=False):
-        prompt = self._create_prompt(file_batch, context_files)
-        
-        if debug_mode:
-            logger.info(f"[DEBUG] ПРОМТ ДЛЯ LLM:\n{prompt}")
-            logger.info(f"[DEBUG] Длина промта: {len(prompt)} символов")
-        
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        payload = {
-            "model": "openai/gpt-4o-mini",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-
-            #"max_tokens": 1200,
-            "temperature": 0.2
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=self.headers, json=payload) as resp:
-                    response_text = await resp.text()
-                    
-                    if debug_mode:
-                        logger.info(f"[DEBUG] ОТВЕТ API:\n{response_text}")
-                    
-                    if resp.status != 200:
-                        logger.error(f"Ошибка API: {resp.status} - {response_text}")
-                        return None, None
-                    
-                    result = json.loads(response_text)
-                    if "choices" not in result or not result["choices"]:
-                        logger.error(f"Неверный ответ: {result}")
-                        return None, None
-                    
-                    analysis = result["choices"][0]["message"]["content"]
-                    
-                    if debug_mode:
-                        logger.info(f"[DEBUG] АНАЛИЗ LLM:\n{analysis}")
-                    
-                    parts = analysis.split("Ошибки:")
-                    desc = parts[0].strip()
-                    errors = parts[1].strip() if len(parts) > 1 else "Нет явных ошибок"
-                    
-                    logger.debug(f"Анализ получен, длина: {len(analysis)}")
-                    return desc, errors
-        except Exception as e:
-            logger.error(f"Ошибка анализа: {e}")
-            return None, None
-    
-
-
-    def _create_prompt(self, modified_files, context_files):
-        # Максимально абстрактный промт, ограничивающийся только явными ошибками
-        prompt = """
-    Ты эксперт по код-ревью Python. Твоя задача - найти ТОЛЬКО ЯВНЫЕ синтаксические ошибки или несоответствия в коде.
-
-    ВАЖНО: НИКОГДА не предполагай ошибки, если:
-    1. Ты не видишь полного определения метода/функции
-    2. Ты не видишь всех импортов и базовых классов
-    3. Ты не можешь на 100% подтвердить ошибку из представленного кода
-
-    Ты должен анализировать только:
-    - Синтаксические ошибки Python (явные ошибки в синтаксисе)
-    - Использование неопределенных переменных (только если ты 100% уверен)
-    - Явные логические ошибки (например, условие if x == x: return False)
-
-    ЗАПРЕЩЕНО сообщать об ошибках, если:
-    - Метод может быть унаследован от родительского класса 
-    - Метод может быть определен в другом месте кода
-    - Сигнатура метода неизвестна полностью
-    - Нет уверенности в требуемых параметрах функции
-
-    Формат ответа:
-    1. Краткое описание изменений: [суть изменений в одном предложении]
-    2. Ошибки: [ТОЛЬКО если 100% явная ошибка синтаксиса] ИЛИ "Нет явных ошибок"
-    """
-        
-        # Добавляем контекстные файлы только для общего понимания
-        if context_files:
-            prompt += "\n\nКОНТЕКСТНЫЕ ФАЙЛЫ:\n"
-            for idx, file in enumerate(context_files):
-                if 'path' in file and 'content' in file:
-                    prompt += f"\nКОНТЕКСТНЫЙ ФАЙЛ {idx+1}: {file['path']}\n```python\n{file['content']}\n```\n"
-        
-        # Добавляем измененные файлы
-        for idx, file in enumerate(modified_files):
-            file_summary = f"\nИЗМЕНЕННЫЙ ФАЙЛ {idx+1}: {file['path']}\n\n"
-            
-            # Добавляем содержимое файла до изменений для контекста
-            if file['old_content']:
-                file_summary += f"СОДЕРЖИМОЕ ДО ИЗМЕНЕНИЙ:\n```python\n{file['old_content']}\n```\n\n"
-            
-            # Добавляем дифф для наглядности изменений
-            file_summary += f"ИЗМЕНЕНИЯ (DIFF):\n```diff\n{file['diff']}\n```\n\n"
-            
-            # Добавляем новое содержимое файла для полного контекста
-            if file['new_content']:
-                file_summary += f"СОДЕРЖИМОЕ ПОСЛЕ ИЗМЕНЕНИЙ:\n```python\n{file['new_content']}\n```\n\n"
-            
-            prompt += file_summary
-        
-        # Финальная инструкция с максимальной строгостью
-        prompt += """
-    НАПОМИНАНИЕ: 
-    - Сообщай ТОЛЬКО о 100% явных ошибках в синтаксисе Python
-    - НИКОГДА не делай предположений о структуре кода, которую не видишь
-    - НЕ предполагай сигнатуры методов без полного определения
-    - НЕ предполагай наличие или отсутствие параметров у методов
-    - При ЛЮБОМ сомнении - ответ "Нет явных ошибок"
-
-    Формат ответа:
-    1. Краткое описание изменений: [суть изменений в одном предложении]
-    2. Ошибки: [ТОЛЬКО 100% явные синтаксические ошибки] ИЛИ "Нет явных ошибок"
-    """
-        
-        logger.debug(f"Создан абстрактный промт, длина: {len(prompt)}")
-        return prompt
-
-
-
-
+            return None, []
 
 class TelegramNotifier:
     def __init__(self, token, chat_id):
@@ -475,7 +310,7 @@ class TelegramNotifier:
             logger.debug(f"Отправлено сообщение, длина: {len(message)}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка отправки сообщения: {e}")
+            logger.error(f"Ошибка отправки сообщения с Markdown: {e}")
             # Попытка отправить без разметки в случае ошибки
             try:
                 await self.bot.send_message(chat_id=self.chat_id, text=message)
@@ -519,7 +354,7 @@ class CommitMonitor:
                 commit_time = parse_datetime(commit.created_at)
                 logger.info(f"Обработка коммита {commit.id[:7]} от {commit_time} в {project_path}")
                 
-                commit_obj, modified_files, context_files = await self.gitlab_client.get_commit_details(
+                commit_obj, modified_files = await self.gitlab_client.get_commit_details(
                     project_path, commit.id, 
                     max_files=self.max_files,
                     max_file_size=self.max_file_size,
@@ -531,8 +366,13 @@ class CommitMonitor:
                     self.db_manager.mark_processed(project_path, commit.id, commit_time)
                     continue
                 
+                # Используем новый анализатор с поддержкой контекста
                 desc, errors = await self.llm_analyzer.analyze_changes(
-                    modified_files, context_files, self.debug_mode
+                    modified_files,
+                    gitlab_client=self.gitlab_client,  # Передаем GitLab клиент
+                    project_path=project_path,        # Передаем путь к проекту
+                    commit_id=commit.id,              # Передаем ID коммита
+                    debug_mode=self.debug_mode
                 )
                 
                 if desc is None:
@@ -665,20 +505,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

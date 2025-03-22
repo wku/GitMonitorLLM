@@ -1,208 +1,307 @@
-# GitLab Commit Monitoring
+# GitMonitorLLM
 
-A system for monitoring commits in GitLab repositories with automatic analysis of changes using LLM and notification via Telegram.
+Intelligent GitLab commit monitoring system with code analysis to identify potential errors and issues.
 
-## Features
+## Description
 
-- Monitoring of multiple GitLab repositories
-- Analysis of code changes using LLM to identify potential errors
-- Detection of code issues, including logical errors and vulnerabilities
-- Sending notifications to Telegram with detailed description of changes
-- Flexible configuration of monitoring parameters via command line arguments
-- Support for various date formats and time zones
+GitMonitorLLM is a tool that tracks commits in GitLab repositories, analyzes changes using artificial intelligence, and sends notifications to Telegram about potential problems.
+
+Key features:
+- Automatic monitoring of commits across multiple repositories
+- Intelligent code change analysis using AI
+- Smart identification of necessary context files for accurate analysis
+- Telegram notifications with links to commits
+- Detailed reports on identified issues and potential errors
+
+## System Architecture
+
+The system consists of the following modules:
+- `main.py` - main commit monitoring module
+- `context_discovery.py` - identification of context files for analysis
+- `code_analyzer.py` - code analysis with context consideration
+- `smart_context_analyzer.py` - enhanced analyzer with contextual understanding
 
 ## Requirements
 
 - Python 3.8+
-- GitLab API access token
-- OpenRouter API key (for LLM code analysis)
-- Telegram bot and chat ID for sending notifications
+- Libraries: python-gitlab, aiohttp, python-telegram-bot, openai, python-dotenv
+- Access to GitLab API
+- API token for OpenRouter
+- Telegram bot
 
 ## Installation
 
 1. Clone the repository:
-```
-git clone <repository-url>
-cd <repository-directory>
+```bash
+git clone https://github.com/wku/GitMonitorLLM.git
+cd GitMonitorLLM
 ```
 
 2. Install dependencies:
-```
+```bash
 pip install -r requirements.txt
 ```
 
-3. Create a `.env` file based on the example below:
+3. Create an `.env` file based on the example:
+```bash
+cp .env.example .env
+```
+
+## Integration Setup
+
+### GitLab
+
+1. Create a personal access token in GitLab:
+   - Log in to your GitLab account
+   - Go to Settings -> Access Tokens
+   - Create a new token with `read_api` permissions (or `api` for full access)
+   - Save the token in a secure place
+
+2. Record your GitLab server URL, for example:
+   - `https://gitlab.com` (for GitLab.com)
+   - `https://gitlab.yourdomain.com` (for self-hosted GitLab)
+
+3. Define the paths to repositories you want to monitor, such as:
+   - `group/project`
+   - `namespace/group/project`
+
+### Telegram Bot
+
+1. Create a new bot through [@BotFather](https://t.me/BotFather):
+   - Send the `/newbot` command
+   - Follow the instructions to create a bot
+   - Get the bot's API token
+
+2. Get the chat ID for sending notifications:
+   - Add the bot to a group or start a personal conversation
+   - Send a message in the chat
+   - Visit `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+   - Find `"chat":{"id":` in the response - this is the chat ID
+
+### OpenRouter
+
+1. Create an account on [OpenRouter](https://openrouter.ai/)
+2. Get an API key in the settings section
+3. Recommended models:
+   - `openai/gpt-4o-mini` (used by default)
+   - `anthropic/claude-3-haiku`
+   - Or other models with good code analysis capabilities
+
+## Environment Configuration
+
+Edit the `.env` file with the following parameters:
+
 ```
 # GitLab settings
-GITLAB_URL=https://gitlab.com
-GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxx
+GITLAB_URL=https://gitlab.yourdomain.com
+GITLAB_TOKEN=your_gitlab_personal_access_token
+REPOSITORIES=group/project1,group/project2
 
 # Telegram settings
-TELEGRAM_TOKEN=5555555555:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-CHAT_ID=123456789
+TELEGRAM_TOKEN=your_telegram_bot_token
+CHAT_ID=your_telegram_chat_id
 
-# Check interval (in seconds)
-CHECK_INTERVAL=300
+# OpenRouter settings
+OPENROUTER_API_KEY=your_openrouter_api_key
+LLM_MODEL=openai/gpt-4o-mini
 
-# Path to SQLite database
-DB_PATH=commits.db
-
-# OpenRouter API settings for LLM analysis
-OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-YOUR_SITE_URL=https://example.com
-YOUR_SITE_NAME=GitLab Monitor
-
-# List of repositories to monitor (comma-separated)
-REPOSITORIES=nordic/finance/payment-gateway,nordic/finance/transaction-service
+# Additional settings
+CHECK_INTERVAL=300  # check interval in seconds
+DB_PATH=commits.db  # path to DB for tracking processed commits
+YOUR_SITE_URL=https://example.com  # for API request headers
+YOUR_SITE_NAME=GitLab Monitor  # name of your tool
 ```
 
-## Setting up integrations
+## Running
 
-### Setting up GitLab token
+### Basic Launch
 
-1. In GitLab, go to your profile: `Preferences` → `Access Tokens`
-2. Create a new token with the following permissions:
-   - `read_api` (to read repository data)
-   - `read_repository` (to access repository content)
-3. Copy the token to the `GITLAB_TOKEN` variable in the `.env` file
+To start monitoring with default settings:
 
-### Setting up Telegram bot
-
-1. Create a new bot via [@BotFather](https://t.me/BotFather)
-2. Get the bot token and copy it to the `TELEGRAM_TOKEN` variable
-3. To get the Chat ID:
-   - Add the bot to the desired chat
-   - Send a message to this chat
-   - Get the chat ID via API: `https://api.telegram.org/bot<token>/getUpdates`
-   - Copy the `chat.id` value to the `CHAT_ID` variable
-
-### Setting up OpenRouter API
-
-1. Register at [OpenRouter](https://openrouter.ai/)
-2. Create an API key in the Settings section
-3. Copy the key to the `OPENROUTER_API_KEY` variable
-4. Fill in the `YOUR_SITE_URL` and `YOUR_SITE_NAME` fields for proper identification
-
-## Usage
-
-### Basic launch
-
-To monitor all repositories from the list with default settings:
-
-```
+```bash
 python main.py
 ```
 
-### Advanced launch options
+### Launch Options
 
-#### Monitor a specific repository
-
-```
-python main.py --repo nordic/finance/payment-gateway
-```
-
-#### Check changes from a specific time
-
-```
-python main.py --since "2025-03-19 17:22"
+1. **Monitor a specific repository**:
+```bash
+python main.py --repo group/specific-project
 ```
 
-#### Check for the last N hours
-
+2. **Check commits for a certain period**:
+```bash
+python main.py --hours 24  # check commits for the last 24 hours
 ```
-python main.py --hours 4
+
+3. **Check commits from a specific date**:
+```bash
+python main.py --since "2023-10-15 08:00"
 ```
 
-#### Debug mode with extended logging
-
-```
+4. **Debug mode with extended logging**:
+```bash
 python main.py --debug
 ```
 
-#### Limiting the amount of data to analyze
-
-```
-python main.py --max-files 3 --max-file-size 50000
-```
-
-#### Combination of parameters
-
-```
-python main.py --repo nordic/finance/transaction-service --hours 2 --debug
+5. **Configure analysis limits**:
+```bash
+python main.py --max-files 10 --max-file-size 20000
 ```
 
-```
-python main.py --repo nordic/finance/payment-gateway --max-file-size 128000
-```
-
-## Project Structure
-
-- `main.py` - the main monitoring script
-- `commits.db` - SQLite database for tracking processed commits
-- `.env` - file with configuration parameters
-
-## Class Description
-
-- `DBManager` - managing SQLite database for tracking commits
-- `GitLabClient` - interacting with GitLab API to get information about commits
-- `LLMAnalyzer` - analyzing code changes using OpenRouter API
-- `TelegramNotifier` - sending notifications via Telegram API
-- `CommitMonitor` - the main class coordinating the work of all components
-
-## Troubleshooting
-
-### Problems with GitLab API access
-
-Make sure that:
-- The GitLab token is not expired
-- The token has the necessary access rights
-- The GitLab URL is specified correctly (including the https:// protocol)
-- You have access to the specified repositories
-
-### Problems with Telegram
-
-- Make sure the bot is added to the right chat
-- Check the correctness of the bot token and Chat ID
-- For group chats, the ID should start with a minus (e.g., -1001234567890)
-
-### Problems with OpenRouter API
-
-- Check the balance and limits of your account on OpenRouter
-- Make sure the `openai/gpt-4o-mini` model is available in your plan
-- If you get token limit exceeded errors, reduce the `max-file-size` and `max-files` parameters
-
-### Problems with date parsing
-
-The system supports various GitLab date formats. In case of problems, make sure that:
-- The time zone in the `--since` parameter corresponds to your local time
-- By default, 'Europe/Stockholm' time zone is used
-
-### Extended debugging
-
-For detailed system operation analysis, use:
-
-```
-python main.py --debug --repo nordic/finance/payment-gateway
+6. **Combination of parameters**:
+```bash
+python main.py --repo group/project --hours 48 --debug --max-files 10
 ```
 
-## Example of a Telegram notification
+## How It Works
+
+1. The system checks for new commits in the specified repositories
+2. For each new commit:
+   - Gets changed files
+   - Uses AI to determine necessary context files
+   - Retrieves context files from the repository
+   - Analyzes changes with context consideration
+   - Sends a report to Telegram with a description of changes and detected issues
+3. Marks processed commits in a local database
+
+## Scheduled Execution
+
+For continuous monitoring, it's recommended to set up scheduled execution using cron or systemd:
+
+### cron Setup Example
+
+```bash
+# Run every 5 minutes
+*/5 * * * * cd /path/to/gitlab-commit-monitor && python main.py >> /var/log/commit-monitor.log 2>&1
+```
+
+### systemd Setup Example
+
+Create a file `/etc/systemd/system/gitlab-commit-monitor.service`:
 
 ```
-nordic/finance/payment-gateway: [a1b2c3d](https://gitlab.com/nordic/finance/payment-gateway/-/commit/a1b2c3d)
-Payment processing function optimization
-Author: Klaus Schmidt
-Changes: Added input validation and improved error handling in API endpoints
+[Unit]
+Description=GitMonitorLLM Service
+After=network.target
 
-⚠️ Errors: Possible issue with null value handling in payment_controller.py, line 127
+[Service]
+User=youruser
+WorkingDirectory=/path/to/gitlab-commit-monitor
+ExecStart=/usr/bin/python3 /path/to/gitlab-commit-monitor/main.py
+Restart=always
+RestartSec=300
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-## Development Plans
+Then enable and start the service:
 
-- GitHub integration (in development)
-- Support for analyzing various programming languages
-- Advanced repository filtering settings
-- Interactive commands in Telegram for monitoring control
+```bash
+sudo systemctl enable gitlab-commit-monitor
+sudo systemctl start gitlab-commit-monitor
+```
 
-## License
+## Known Issues and Solutions
 
-MIT
+### "can't concat str to bytes" Error
+
+If you see this error in the logs when retrieving file contents, the issue is related to handling byte data from the GitLab API. Solution:
+
+```python
+# Incorrect implementation
+content = project.files.get(file_path=file_path, ref=commit_id).decode()
+
+# Correct implementation
+file_obj = project.files.get(file_path=file_path, ref=commit_id)
+if hasattr(file_obj, 'content'):
+    content = file_obj.content
+    if isinstance(content, str):
+        return content
+    else:
+        import base64
+        return base64.b64decode(content).decode('utf-8', errors='replace')
+elif hasattr(file_obj, 'decode'):
+    return file_obj.decode()
+```
+
+### "502: GitLab is not responding" Error
+
+Temporary GitLab API failures occur quite frequently. Recommended:
+
+1. Implement a retry mechanism for GitLab API requests:
+
+```python
+def gitlab_retry(max_retries=3, retry_delay=5):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except gitlab.exceptions.GitlabError as e:
+                    if hasattr(e, 'response_code') and e.response_code in [429, 500, 502, 503, 504]:
+                        retries += 1
+                        if retries >= max_retries:
+                            logger.error(f"Maximum number of attempts exceeded ({max_retries}): {e}")
+                            break
+                        logger.warning(f"Temporary GitLab API error: {e}. Retry {retries}/{max_retries}")
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"GitLab API error: {e}")
+                        break
+            return None
+        return wrapper
+    return decorator
+```
+
+2. Increase timeouts when working with GitLab API
+3. Check the stability of your connection to the GitLab server
+
+### GitLab Authorization Errors
+
+- Check the correctness of the token
+- Make sure the token has sufficient permissions
+- Verify that the GitLab URL is specified correctly
+
+### Telegram Errors
+
+- Make sure the bot has access to the chat
+- Check the correctness of the bot token and chat ID
+
+### OpenRouter Issues
+
+- Check the balance and request quotas
+- Make sure the API key is correct
+- Check the availability of the selected model
+
+### General Analysis Issues
+
+- Increase `max-file-size` if files are being truncated
+- Enable `--debug` mode for detailed logging
+- Check the error log for analysis errors
+
+## Notes
+
+- The system stores information about processed commits in an SQLite database
+- Large repositories may require more resources for analysis
+- Analysis quality depends on the AI model used
+- For best results, it's recommended to use `openai/gpt-4o-mini` or better
+- When processing large projects, it's recommended to increase the `max-files` and `max-file-size` values
+
+## Example Telegram Output
+
+```
+research/biotech/genomic-data-processor: [d3151d7](https://gitlab.com/research/biotech/genomic-data-processor/-/commit/d3151d7cbc57a64d663202ab63e4e5e4632f4efa)
+[dev] Fixed retrieve method
+Author: Magnus L.
+Changes: Changed retrieve method call to get in the manage_sequence method of the GenomeSequenceAnalyzerViewSet class.
+
+⚠️ Errors: In the manage_sequence method, the self.get(request) call might be incorrect, as you need to pass a pk parameter to identify the object.
+```
+
+## Contributing
+
+Contributions to the project are welcome! Please create an issue or pull request if you have suggestions for improvement.
